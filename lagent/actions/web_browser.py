@@ -7,22 +7,25 @@ import os
 import random
 import re
 import time
+import urllib.parse
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.client import HTTPSConnection
+from io import BytesIO
 from typing import List, Optional, Tuple, Type, Union
 
 import aiohttp
-import aiohttp.client_exceptions
+import pdfplumber
 import requests
 from asyncache import cached as acached
 from bs4 import BeautifulSoup
 from cachetools import TTLCache, cached
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, ProxyConfig
 
 from lagent.actions.base_action import AsyncActionMixin, BaseAction, tool_api
 from lagent.actions.parser import BaseParser, JsonParser
-from lagent.utils import async_as_completed
+from lagent.utils import async_as_completed, create_object
 
 
 class BaseSearch:
@@ -781,37 +784,289 @@ class TencentSearch(BaseSearch):
         return self._filter_results(raw_results)
 
 
-class ContentFetcher:
+class JinaAISearch(BaseSearch):
+    """
+    Wrapper around the Jina.ai Search API.
 
-    def __init__(self, timeout: int = 5):
+    Args:
+        api_key (str): API key for Jina.ai service.
+        topk (int): Number of top results to return, default is 3.
+        black_list (List[str]): Blacklist of domains to filter out.
+        **kwargs: Other keyword arguments including proxy settings.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        topk: int = 3,
+        black_list: List[str] = [
+            'enoN',
+            'youtube.com',
+            'bilibili.com',
+            'researchgate.net',
+        ],
+        **kwargs,
+    ):
+        self.api_key = api_key
+        self.proxy = kwargs.get('proxy')
+        self.timeout = kwargs.get('timeout', 300)
+        super().__init__(topk, black_list)
+
+    @cached(cache=TTLCache(maxsize=100, ttl=600))
+    def search(self, query: str, max_retry: int = 20) -> dict:
+        for attempt in range(max_retry):
+            try:
+                response = self._call_jina_api(query)
+                return self._parse_response(response)
+            except Exception as e:
+                logging.exception(str(e))
+                warnings.warn(f'Retry {attempt + 1}/{max_retry} due to error: {e}')
+                time.sleep(random.randint(2, 5))
+        raise Exception('Failed to get search results from Jina Search after retries.')
+
+    @acached(cache=TTLCache(maxsize=100, ttl=600))
+    async def asearch(self, query: str, max_retry: int = 20) -> dict:
+        for attempt in range(max_retry):
+            try:
+                response = await self._async_call_jina_api(query)
+                return self._parse_response(response)
+            except Exception as e:
+                logging.exception(str(e))
+                warnings.warn(f'Retry {attempt + 1}/{max_retry} due to error: {e}')
+                await asyncio.sleep(random.randint(2, 5))
+        raise Exception('Failed to get search results from Jina Search after retries.')
+
+    def _call_jina_api(self, query: str) -> List[dict]:
+        """Synchronous call to Jina API using requests"""
+        url, headers = f"https://s.jina.ai/?q={urllib.parse.quote(query)}", {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.api_key}',
+            "X-No-Cache": "true",
+            'X-Respond-With': 'no-content',
+        }
+        response = requests.get(url, headers=headers, timeout=self.timeout, proxies=self.proxy)
+        if response.status_code >= 400:
+            try:
+                error_response = response.json()
+                if response.status_code == 402:
+                    raise Exception(error_response.get('readableMessage', 'Insufficient balance'))
+                if response.status_code == 429:  # Rate limit error
+                    retry_after = error_response.get('retryAfter', 5)
+                    logging.warning(f"Rate limit exceeded. Retrying after {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    raise Exception('Rate limit exceeded')
+                raise Exception(error_response.get('readableMessage', f'HTTP Error {response.status_code}'))
+            except json.JSONDecodeError:
+                raise Exception(f'HTTP Error {response.status_code}')
+
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError as e:
+            raise Exception(f'Failed to parse response: {str(e)}')
+
+        if not response_data.get('data') or not isinstance(response_data['data'], list):
+            raise Exception('Invalid response format')
+
+        return response_data["data"]
+
+    async def _async_call_jina_api(self, query: str) -> List[dict]:
+        """Asynchronous call to Jina API"""
+        url, headers = f"https://s.jina.ai/?q={urllib.parse.quote(query)}", {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.api_key}',
+            "X-No-Cache": "true",
+            'X-Respond-With': 'no-content',
+        }
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout), raise_for_status=True
+        ) as session:
+            async with session.get(
+                url, headers=headers, proxy=self.proxy and (self.proxy.get('http') or self.proxy.get('https'))
+            ) as res:
+                response_data = await res.text()
+                if res.status >= 400:
+                    try:
+                        error_response = json.loads(response_data)
+                        if res.status == 402:
+                            raise Exception(error_response.get('readableMessage', 'Insufficient balance'))
+                        if res.status == 429:  # Rate limit error
+                            retry_after = error_response.get('retryAfter', 5)
+                            logging.warning(f"Rate limit exceeded. Retrying after {retry_after} seconds...")
+                            await asyncio.sleep(retry_after)
+                            raise Exception('Rate limit exceeded')
+                        raise Exception(error_response.get('readableMessage', f'HTTP Error {res.status}'))
+                    except json.JSONDecodeError:
+                        raise Exception(f'HTTP Error {res.status}')
+
+                try:
+                    response = json.loads(response_data)
+                except json.JSONDecodeError as e:
+                    raise Exception(f'Failed to parse response: {str(e)}')
+
+                if not response.get('data') or not isinstance(response['data'], list):
+                    raise Exception('Invalid response format')
+
+                return response["data"]
+
+    def _parse_response(self, response: List[dict]) -> dict:
+        """Parse Jina API response"""
+        raw_results = []
+        for item in response:
+            # Extract URL, description/content, and title from Jina response
+            url = item.get('url', '')
+            content = item.get('content', '') or item.get('description', '') or item.get('snippet', '')
+            title = item.get('title', '')
+
+            if url and content:  # Only add results with both URL and content
+                raw_results.append((url, content, title))
+
+        return self._filter_results(raw_results)
+
+
+class BaseFetcher:
+    def __init__(self, timeout: int = 5, proxy: Optional[dict] = None, remove_links: bool = False):
         self.timeout = timeout
+        self.proxy = proxy
+        self.remove_links = remove_links
 
     @cached(cache=TTLCache(maxsize=100, ttl=600))
     def fetch(self, url: str) -> Tuple[bool, str]:
         try:
-            response = requests.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            html = response.content
-        except requests.RequestException as e:
+            text = self.process(url)
+            return True, text
+        except Exception as e:
             return False, str(e)
-
-        text = BeautifulSoup(html, 'html.parser').get_text()
-        cleaned_text = re.sub(r'\n+', '\n', text)
-        return True, cleaned_text
 
     @acached(cache=TTLCache(maxsize=100, ttl=600))
     async def afetch(self, url: str) -> Tuple[bool, str]:
         try:
-            async with aiohttp.ClientSession(
-                raise_for_status=True, timeout=aiohttp.ClientTimeout(self.timeout)
-            ) as session:
-                async with session.get(url) as resp:
-                    html = await resp.text(errors='ignore')
-                    text = BeautifulSoup(html, 'html.parser').get_text()
-                    cleaned_text = re.sub(r'\n+', '\n', text)
-                    return True, cleaned_text
+            text = await self.aprocess(url)
+            return True, text
         except Exception as e:
             return False, str(e)
+
+    def process(self, url: str) -> str:
+        raise NotImplementedError("Subclasses should implement this method.")
+
+    async def aprocess(self, url: str) -> str:
+        raise NotImplementedError("Subclasses should implement this method.")
+
+
+class BeautifulSoupFetcher(BaseFetcher):
+    """Process the URL to fetch content using BeautifulSoup and pdfplumber."""
+
+    def process(self, url: str) -> str:
+        response = requests.get(url, timeout=self.timeout, proxies=self.proxy)
+        response.raise_for_status()
+        if '.pdf' in url.lower():
+            with pdfplumber.open(BytesIO(response.content)) as pdf:
+                text = ''
+                for page in pdf.pages:
+                    text += page.extract_text() or ''
+        else:
+            text = BeautifulSoup(response.content, 'html.parser').get_text()
+        if self.remove_links:
+            text = re.sub(r"\(https?:.*?\)|\[https?:.*?\]", "", text)
+        cleaned_text = re.sub(r'\n+', '\n', text)
+        return cleaned_text
+
+    async def aprocess(self, url: str) -> str:
+        async with aiohttp.ClientSession(
+            raise_for_status=True, timeout=aiohttp.ClientTimeout(self.timeout)
+        ) as session:
+            async with session.get(
+                url, proxy=self.proxy and (self.proxy.get('http') or self.proxy.get('https'))
+            ) as resp:
+                if '.pdf' in url.lower():
+                    pdf_content = await resp.read()
+                    with pdfplumber.open(BytesIO(pdf_content)) as pdf:
+                        text = ''
+                        for page in pdf.pages:
+                            text += page.extract_text() or ''
+                else:
+                    html = await resp.text(errors='ignore')
+                    text = BeautifulSoup(html, 'html.parser').get_text()
+                if self.remove_links:
+                    text = re.sub(r"\(https?:.*?\)|\[https?:.*?\]", "", text)
+                cleaned_text = re.sub(r'\n+', '\n', text)
+                return cleaned_text
+
+
+class JinaAIFetcher(BaseFetcher):
+    """Process the URL to fetch content using Jina AI's API."""
+
+    def __init__(self, api_key: str, timeout: int = 20, proxy: Optional[dict] = None, remove_links: bool = False):
+        super().__init__(timeout, proxy, remove_links)
+        self.api_key = api_key
+
+    def process(self, url: str) -> str:
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'X-Return-Format': 'markdown',
+        }
+        response = requests.get(f'https://r.jina.ai/{url}', headers=headers, proxies=self.proxy, timeout=self.timeout)
+        response.raise_for_status()
+        text = response.text
+        if self.remove_links:
+            text = re.sub(r"\(https?:.*?\)|\[https?:.*?\]", "", text)
+        cleaned_text = re.sub(r'=+', '=', text)
+        cleaned_text = re.sub(r'-+', '-', cleaned_text)
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+        return cleaned_text
+
+    async def aprocess(self, url: str) -> str:
+        headers, proxy = {
+            'Authorization': f'Bearer {self.api_key}',
+            'X-Return-Format': 'markdown',
+        }, self.proxy and (self.proxy.get('http') or self.proxy.get('https'))
+        async with aiohttp.ClientSession(
+            raise_for_status=True, timeout=aiohttp.ClientTimeout(self.timeout)
+        ) as session:
+            async with session.get(f'https://r.jina.ai/{url}', headers=headers, proxy=proxy) as response:
+                text = await response.text()
+                if self.remove_links:
+                    text = re.sub(r"\(https?:.*?\)|\[https?:.*?\]", "", text)
+                cleaned_text = re.sub(r'=+', '=', text)
+                cleaned_text = re.sub(r'-+', '-', cleaned_text)
+                cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+                return cleaned_text
+
+
+class Crawl4AIFetcher(BaseFetcher):
+    """Process the URL to fetch content using Crawl4AI's API."""
+
+    def __init__(self, timeout: int = 60, proxy: Optional[dict] = None, remove_links: bool = False):
+        super().__init__(timeout, proxy, remove_links)
+        self.browser_config = BrowserConfig(
+            headless=True,
+            browser_type="chromium",
+            viewport_height=1080,
+            viewport_width=1920,
+            text_mode=True,
+            # use_managed_browser=True,
+            # user_data_dir="",
+        )
+        self.run_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            magic=True,
+            verbose=False,
+            delay_before_return_html=2,
+            scan_full_page=True,
+            wait_until='commit',
+            proxy_config=self.proxy
+            and ProxyConfig.from_dict({'server': self.proxy.get('http') or self.proxy.get('https')}),
+            stream=False,
+            page_timeout=self.timeout * 1000,
+            exclude_external_links=self.remove_links,
+            # remove_overlay_elements=True,
+        )
+        self.crawler = AsyncWebCrawler(config=self.browser_config)
+
+    async def aprocess(self, url):
+        result = await self.crawler.arun(url, config=self.run_config)
+        if result and result.success:
+            return result.markdown
+        return f"WebParserClient error: {result.get('error', 'Unknown error') if result else 'No results returned'}"
 
 
 class WebBrowser(BaseAction):
@@ -833,7 +1088,7 @@ class WebBrowser(BaseAction):
         **kwargs,
     ):
         self.searcher = eval(searcher_type)(black_list=black_list, topk=topk, **kwargs)
-        self.fetcher = ContentFetcher(timeout=timeout)
+        self.fetcher = BeautifulSoupFetcher(timeout=timeout)
         self.search_results = None
         super().__init__(description, parser)
 
@@ -902,8 +1157,7 @@ class WebBrowser(BaseAction):
         web_success, web_content = self.fetcher.fetch(url)
         if web_success:
             return {'type': 'text', 'content': web_content}
-        else:
-            return {'error': web_content}
+        return {'error': web_content}
 
 
 class AsyncWebBrowser(AsyncActionMixin, WebBrowser):
@@ -976,5 +1230,164 @@ class AsyncWebBrowser(AsyncActionMixin, WebBrowser):
         web_success, web_content = await self.fetcher.afetch(url)
         if web_success:
             return {'type': 'text', 'content': web_content}
-        else:
-            return {'error': web_content}
+        return {'error': web_content}
+
+
+class WebBrowserV2(BaseAction):
+    """Wrapper around the Web Browser Tool."""
+
+    def __init__(
+        self,
+        searcher: dict = dict(
+            type=DuckDuckGoSearch,
+            topk=20,
+            black_list=['enoN', 'youtube.com', 'bilibili.com', 'researchgate.net'],
+        ),
+        fetcher: dict = dict(type=BeautifulSoupFetcher, timeout=5, remove_links=False),
+        description: Optional[dict] = None,
+        parser: Type[BaseParser] = JsonParser,
+    ):
+        self.searcher = create_object(searcher)
+        self.fetcher = create_object(fetcher)
+        self.search_results = None
+        super().__init__(description, parser)
+
+    @tool_api
+    def search(self, query: Union[str, List[str]]) -> dict:
+        """BING search API
+        Args:
+            query (List[str]): list of search query strings
+        """
+        queries = query if isinstance(query, list) else [query]
+        search_results = {}
+
+        with ThreadPoolExecutor() as executor:
+            future_to_query = {executor.submit(self.searcher.search, q): q for q in queries}
+
+            for future in as_completed(future_to_query):
+                query = future_to_query[future]
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    warnings.warn(f'{query} generated an exception: {exc}')
+                else:
+                    for result in results.values():
+                        if result['url'] not in search_results:
+                            search_results[result['url']] = result
+                        else:
+                            search_results[result['url']]['summ'] += f"\n{result['summ']}"
+
+        self.search_results = {idx: result for idx, result in enumerate(search_results.values())}
+        return self.search_results
+
+    @tool_api
+    def select(self, select_ids: List[int]) -> dict:
+        """get the detailed content on the selected pages.
+
+        Args:
+            select_ids (List[int]): list of index to select. Max number of index to be selected is no more than 4.
+        """
+        if not self.search_results:
+            raise ValueError('No search results to select from.')
+
+        new_search_results = {}
+        with ThreadPoolExecutor() as executor:
+            future_to_id = {
+                executor.submit(self.fetcher.fetch, self.search_results[select_id]['url']): select_id
+                for select_id in select_ids
+                if select_id in self.search_results
+            }
+            for future in as_completed(future_to_id):
+                select_id = future_to_id[future]
+                try:
+                    web_success, web_content = future.result()
+                except Exception as exc:
+                    warnings.warn(f'{select_id} generated an exception: {exc}')
+                else:
+                    if web_success:
+                        self.search_results[select_id]['content'] = web_content[:8192]
+                        new_search_results[select_id] = self.search_results[select_id].copy()
+                        new_search_results[select_id].pop('summ')
+
+        return new_search_results
+
+    @tool_api
+    def open_url(self, url: str) -> dict:
+        print(f'Start Browsing: {url}')
+        web_success, web_content = self.fetcher.fetch(url)
+        if web_success:
+            return {'type': 'text', 'content': web_content}
+        return {'error': web_content}
+
+
+class AsyncWebBrowserV2(AsyncActionMixin, WebBrowserV2):
+    """Wrapper around the Web Browser Tool."""
+
+    @tool_api
+    async def search(self, query: Union[str, List[str]]) -> dict:
+        """BING search API
+
+        Args:
+            query (List[str]): list of search query strings
+        """
+        queries = query if isinstance(query, list) else [query]
+        search_results = {}
+
+        tasks = []
+        for q in queries:
+            task = asyncio.create_task(self.searcher.asearch(q))
+            task.query = q
+            tasks.append(task)
+        async for future in async_as_completed(tasks):
+            query = future.query
+            try:
+                results = await future
+            except Exception as exc:
+                warnings.warn(f'{query} generated an exception: {exc}')
+            else:
+                for result in results.values():
+                    if result['url'] not in search_results:
+                        search_results[result['url']] = result
+                    else:
+                        search_results[result['url']]['summ'] += f"\n{result['summ']}"
+
+        self.search_results = {idx: result for idx, result in enumerate(search_results.values())}
+        return self.search_results
+
+    @tool_api
+    async def select(self, select_ids: List[int]) -> dict:
+        """get the detailed content on the selected pages.
+
+        Args:
+            select_ids (List[int]): list of index to select. Max number of index to be selected is no more than 4.
+        """
+        if not self.search_results:
+            raise ValueError('No search results to select from.')
+
+        new_search_results = {}
+        tasks = []
+        for select_id in select_ids:
+            if select_id in self.search_results:
+                task = asyncio.create_task(self.fetcher.afetch(self.search_results[select_id]['url']))
+                task.select_id = select_id
+                tasks.append(task)
+        async for future in async_as_completed(tasks):
+            select_id = future.select_id
+            try:
+                web_success, web_content = await future
+            except Exception as exc:
+                warnings.warn(f'{select_id} generated an exception: {exc}')
+            else:
+                if web_success:
+                    self.search_results[select_id]['content'] = web_content[:8192]
+                    new_search_results[select_id] = self.search_results[select_id].copy()
+                    new_search_results[select_id].pop('summ')
+        return new_search_results
+
+    @tool_api
+    async def open_url(self, url: str) -> dict:
+        print(f'Start Browsing: {url}')
+        web_success, web_content = await self.fetcher.afetch(url)
+        if web_success:
+            return {'type': 'text', 'content': web_content}
+        return {'error': web_content}

@@ -3,6 +3,7 @@ anthropic
 arxiv
 asyncache
 asyncer
+crawl4ai
 distro
 filelock
 func_timeout
