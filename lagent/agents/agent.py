@@ -159,6 +159,28 @@ class Agent:
                 for agent in getattr(self, '_agents', {}).values():
                     agent.reset(session_id, recursive=True)
 
+    def get_messages(self, session_id=0, keypath: Optional[str] = None) -> List[dict]:
+        """Get OpenAI format messages from memory.
+
+        Args:
+            session_id (int): The session id of the memory.
+            keypath (Optional[str]): The keypath of the sub-agent to get messages from. Default is None.
+
+        Returns:
+            List[dict]: The messages from the memory including the sub-agent's system prompt.
+        """
+        if keypath:
+            keys, agent = keypath.split('.'), self
+            for key in keys:
+                agents = getattr(agent, '_agents', {})
+                if key not in agents:
+                    raise KeyError(f'No sub-agent named {key} in {agent}')
+                agent = agents[key]
+            return agent.get_messages(session_id=session_id)
+        if self.aggregator:
+            return self.aggregator.aggregate(self.memory.get(session_id), self.name, self.output_format, self.template)
+        raise ValueError(f'{self.name} has no aggregator to get messages')
+
     def __repr__(self):
 
         def _rcsv_repr(agent, n_indent=1):
